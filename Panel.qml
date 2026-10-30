@@ -60,20 +60,26 @@ Panel {
                                      && state.configured !== false
   readonly property bool stale: configured && state.stale === true
   readonly property bool wanUp: wan && wan.up === true
+  readonly property bool wanDown: wan && wan.up === false
+  readonly property string wanTitle: wanUp ? "Internet up"
+                                   : wanDown ? "Internet down" : "Internet status unavailable"
   // Deliberately excludes `stale` and `notices`: a dropped poll gets the bar's
   // quiet dot, and a deferred firmware update should not look like an outage.
-  readonly property bool healthy: configured && wanUp && alerts.length === 0
+  readonly property bool healthy: configured && !wanDown && alerts.length === 0
 
   readonly property string barTooltip: {
     if (!configured) return "UniFi Network — not set up yet"
     if (stale) return "UniFi Network — " + (state.error || "cannot reach console")
     var lines = [
-      (wanUp ? "Internet up" : "Internet DOWN") + (wan.ip ? " · " + wan.ip : ""),
-      "↓ " + humanBps(wan.downBps) + "bps   ↑ " + humanBps(wan.upBps) + "bps",
+      wanTitle + (wan.ip ? " · " + wan.ip : "")
+    ]
+    if (wanUp || wanDown)
+      lines.push("↓ " + humanBps(wan.downBps) + "bps   ↑ " + humanBps(wan.upBps) + "bps")
+    lines.push(
       (clients.total || 0) + " clients · " + (clients.wireless || 0) + " wireless, "
         + (clients.wired || 0) + " wired",
       (devices.online || 0) + "/" + (devices.total || 0) + " devices online"
-    ]
+    )
     for (var i = 0; i < alerts.length; i++) lines.push("! " + alerts[i])
     return lines.join("\n")
   }
@@ -439,13 +445,15 @@ Panel {
             PanelHero {
               visible: root.configured
               width: parent.width
-              foreground: root.wanUp && !root.stale ? root.foreground : root.urgent
+              foreground: root.stale || root.wanDown ? root.urgent
+                        : root.wanUp ? root.foreground : root.dim
               fontFamily: root.fontFamily
               title: root.stale ? "Console unreachable"
-                   : (root.wanUp ? "Internet up" : "Internet down")
+                   : root.wanTitle
               meta: {
                 if (root.stale) return "last reading " + root.relativeAge(root.state.updatedAt)
-                if (!root.wanUp) return root.state.error || "No WAN connectivity"
+                if (root.wanDown) return root.state.error || "No WAN connectivity"
+                if (!root.wanUp) return "WAN status is not reported by the controller"
                 var parts = []
                 if (root.wan.ip) parts.push(root.wan.ip)
                 if (root.wan.latencyMs >= 0) parts.push(Math.round(root.wan.latencyMs) + " ms")

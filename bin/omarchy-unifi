@@ -397,11 +397,14 @@ def build_wan(subs: dict) -> dict:
     wan = subs.get("wan", {})
     www = subs.get("www", {})
     status = str(wan.get("status") or "unknown").lower()
+    # Third-party routers may have no WAN subsystem. Only reported failures
+    # confirm downtime; an unknown or unrecognised status is unavailable.
+    up = True if status == "ok" else False if status in ("warning", "error") else None
     # `*_bytes-r` are instantaneous byte-per-second rates from the gateway,
     # so no delta bookkeeping is needed between polls.
     return {
         "status": status,
-        "up": status == "ok",
+        "up": up,
         "ip": wan.get("wan_ip") or "",
         "gatewayMac": wan.get("gw_mac") or "",
         "gatewayName": wan.get("gw_name") or "",
@@ -496,7 +499,7 @@ def build_client_list(clients: list) -> list:
 def build_alerts(wan: dict, devices: dict) -> list:
     """Things that are wrong right now. These colour the bar."""
     alerts = []
-    if not wan["up"]:
+    if wan.get("up") is False:
         alerts.append("Internet is down")
     if devices["offline"]:
         noun = "device" if devices["offline"] == 1 else "devices"
@@ -600,7 +603,7 @@ def error_state(api: UniFi, message: str) -> dict:
         "site": getattr(api, "site", "default"),
         # Keep the last good reading so the panel can show stale data with a
         # warning rather than an empty screen during a blip.
-        "wan": previous.get("wan", {"status": "unknown", "up": False}),
+        "wan": previous.get("wan", {"status": "unknown", "up": None}),
         "clients": previous.get("clients", {}),
         "clientList": previous.get("clientList", []),
         "blockedList": previous.get("blockedList", []),
@@ -874,10 +877,12 @@ def cmd_status(args) -> int:
     wan = state.get("wan", {})
     clients = state.get("clients", {})
     devices = state.get("devices", {})
-    mark = "up" if wan.get("up") else "DOWN"
+    up = wan.get("up")
+    mark = "up" if up is True else "DOWN" if up is False else "unknown"
     print(f"internet   {mark}  {wan.get('ip', '')}".rstrip())
-    print(f"throughput down {human_bps(wan.get('downBps', 0))}bps  "
-          f"up {human_bps(wan.get('upBps', 0))}bps")
+    if up is not None:
+        print(f"throughput down {human_bps(wan.get('downBps', 0))}bps  "
+              f"up {human_bps(wan.get('upBps', 0))}bps")
     print(f"clients    {clients.get('total', 0)} "
           f"({clients.get('wireless', 0)} wireless, {clients.get('wired', 0)} wired)")
     print(f"devices    {devices.get('online', 0)}/{devices.get('total', 0)} online")

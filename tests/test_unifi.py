@@ -6,6 +6,7 @@ numbers, and subsystems that report `unknown`.
 """
 
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -13,6 +14,9 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
+from types import SimpleNamespace
+from unittest import mock
 
 BIN = pathlib.Path(__file__).resolve().parent.parent / "bin" / "omarchy-unifi"
 spec = importlib.util.spec_from_loader(
@@ -79,7 +83,7 @@ class TestWan(unittest.TestCase):
         self.wan = uni.build_wan(uni._subsystems(HEALTH))
 
     def test_reports_up_and_address(self):
-        self.assertTrue(self.wan["up"])
+        self.assertIs(self.wan["up"], True)
         self.assertEqual(self.wan["status"], "ok")
         self.assertEqual(self.wan["ip"], "203.0.113.42")
 
@@ -92,14 +96,32 @@ class TestWan(unittest.TestCase):
         self.assertEqual(self.wan["latencyMs"], 12)
 
     def test_wan_down_is_detected(self):
-        health = [dict(h) for h in HEALTH]
-        health[0]["status"] = "error"
-        wan = uni.build_wan(uni._subsystems(health))
-        self.assertFalse(wan["up"])
+        for status in ("error", "warning"):
+            with self.subTest(status=status):
+                health = [dict(h) for h in HEALTH]
+                health[0]["status"] = status
+                wan = uni.build_wan(uni._subsystems(health))
+                self.assertIs(wan["up"], False)
+
+    def test_unavailable_status_does_not_confirm_downtime(self):
+        for status in (None, "", "unknown", "unavailable", "unexpected"):
+            with self.subTest(status=status):
+                wan = uni.build_wan({"wan": {"status": status}})
+                self.assertIsNone(wan["up"])
+
+    def test_wan_without_status_is_unavailable(self):
+        self.assertIsNone(uni.build_wan({"wan": {}})["up"])
+
+    def test_www_alone_does_not_determine_wan_state(self):
+        for status in ("ok", "error", "unknown"):
+            with self.subTest(status=status):
+                wan = uni.build_wan({"www": {"status": status, "latency": 12}})
+                self.assertIsNone(wan["up"])
 
     def test_missing_subsystems_do_not_raise(self):
         wan = uni.build_wan({})
-        self.assertFalse(wan["up"])
+        self.assertIsNone(wan["up"])
+        self.assertEqual(wan["status"], "unknown")
         self.assertEqual(wan["downBps"], 0)
         self.assertEqual(wan["latencyMs"], -1)
 
@@ -200,6 +222,18 @@ class TestUntrustedNames(unittest.TestCase):
 
 
 class TestAlerts(unittest.TestCase):
+    def test_only_confirmed_wan_failure_alerts(self):
+        devices = uni.build_devices([])
+        for wan, expected in (({"up": True}, []),
+                              ({"up": False}, ["Internet is down"]),
+                              ({"up": None}, []), ({}, [])):
+            with self.subTest(wan=wan):
+                self.assertEqual(uni.build_alerts(wan, devices), expected)
+
+    def test_unavailable_wan_keeps_device_alerts(self):
+        self.assertEqual(uni.build_alerts(uni.build_wan({}), uni.build_devices(DEVICES)),
+                         ["1 device offline"])
+
     def test_healthy_network_has_no_alerts(self):
         health = [dict(h) for h in HEALTH]
         devices = uni.build_devices(DEVICES[:2])
@@ -243,6 +277,46 @@ class TestAlerts(unittest.TestCase):
         devices["updatable"] = 0
         self.assertEqual(uni.build_alerts({"up": True}, devices), [])
         self.assertEqual(uni.build_notices(devices), [])
+
+
+class TestCollection(unittest.TestCase):
+    def test_third_party_router_has_counts_without_internet_alert(self):
+        # Four adopted APs/switches and 19 clients cannot establish WAN health.
+        devices = [dict(DEVICES[1], _id=str(i), type="uap" if i < 2 else "usw",
+                        upgradable=False) for i in range(4)]
+        clients = [dict(CLIENTS[0], mac=f"11:22:33:44:55:{i:02x}") for i in range(19)]
+        for wan in ([], [{"subsystem": "wan", "status": "unknown"}]):
+            with self.subTest(wan=wan):
+                responses = {"stat/health": HEALTH[2:] + wan,
+                             "stat/device": devices, "stat/sta": clients, "rest/user": []}
+                api = mock.Mock(host="controller.example", site="default")
+                api.legacy.side_effect = responses.__getitem__
+                state = uni.collect(api)
+                self.assertTrue(state["ok"])
+                self.assertIsNone(state["wan"]["up"])
+                self.assertEqual(state["devices"]["online"], 4)
+                self.assertEqual(state["devices"]["total"], 4)
+                self.assertEqual(state["clients"]["total"], 19)
+                self.assertEqual(state["alerts"], [])
+
+
+class TestStatus(unittest.TestCase):
+    def test_wan_states_are_distinct_in_text_output(self):
+        for wan, label in (({"up": True}, "up"), ({"up": False}, "DOWN"),
+                           ({"up": None}, "unknown"), ({}, "unknown")):
+            with self.subTest(wan=wan):
+                output = io.StringIO()
+                with mock.patch.object(uni, "read_state", return_value={"wan": wan}), \
+                        redirect_stdout(output):
+                    self.assertEqual(uni.cmd_status(SimpleNamespace(json=False)), 0)
+                self.assertEqual(output.getvalue().splitlines()[0], f"internet   {label}")
+
+    def test_unknown_wan_survives_json_output(self):
+        output = io.StringIO()
+        with mock.patch.object(uni, "read_state", return_value={"wan": uni.build_wan({})}), \
+                redirect_stdout(output):
+            self.assertEqual(uni.cmd_status(SimpleNamespace(json=True)), 0)
+        self.assertIsNone(json.loads(output.getvalue())["wan"]["up"])
 
 
 class FakeResponse:
@@ -372,6 +446,14 @@ class TestFormatting(unittest.TestCase):
 
 
 class TestStatePersistence(unittest.TestCase):
+    def test_first_poll_failure_leaves_wan_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(uni, "STATE_PATH", os.path.join(tmp, "state.json")):
+                state = uni.error_state(
+                    uni.UniFi({"host": "h", "apiKey": "k"}), "cannot reach h")
+        self.assertIsNone(state["wan"]["up"])
+        self.assertEqual(state["alerts"], ["cannot reach h"])
+
     def test_state_is_written_private_and_reread(self):
         with tempfile.TemporaryDirectory() as tmp:
             uni.STATE_DIR = tmp

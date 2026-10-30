@@ -33,7 +33,7 @@ BarWidget {
   readonly property string throughputText: {
     if (!panelLoader.item) return ""
     var wan = state && state.wan ? state.wan : null
-    if (!wan) return ""
+    if (!wan || (wan.up !== true && wan.up !== false)) return ""
     return "↓" + panelLoader.item.humanBps(wan.downBps)
          + " ↑" + panelLoader.item.humanBps(wan.upBps)
   }
